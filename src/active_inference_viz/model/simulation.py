@@ -1,7 +1,9 @@
 """Simulation runner: executes a trial and returns SimResult.
 
-Simplified body model (no Pymunk physics): actions directly update joint angles.
-This captures the core active inference dynamics faithfully.
+Body model: the arm tracks the brain's believed angles with a simple
+spring-like lag. This creates the prediction-error loop that drives
+active inference while being faithful to the theory without needing
+a full physics engine (Pymunk).
 """
 
 from __future__ import annotations
@@ -17,6 +19,9 @@ from active_inference_viz.model.math_utils import (
     normalize,
 )
 
+# How fast the body tracks the brain's belief (higher = faster tracking)
+BODY_TRACKING_GAIN = 8.0
+
 
 def _generate_cue(cfg: SimConfig, cue_idx: int) -> NDArray[np.float64]:
     """Generate a one-hot cue vector from the cue sequence."""
@@ -29,6 +34,12 @@ def _generate_cue(cfg: SimConfig, cue_idx: int) -> NDArray[np.float64]:
 def run_trial(cfg: SimConfig) -> SimResult:
     """Execute a single trial simulation.
 
+    The simulation loop:
+    1. Brain receives observations from the body
+    2. Brain runs inference (discrete + continuous)
+    3. Body tracks toward brain's believed angles (spring model)
+    4. The tracking lag creates prediction errors that drive the loop
+
     Args:
         cfg: Immutable simulation configuration.
 
@@ -37,6 +48,7 @@ def run_trial(cfg: SimConfig) -> SimResult:
     """
     n_steps = cfg.n_steps
     n_joints = cfg.n_joints
+    lengths_norm = np.array(cfg.lengths_norm)
 
     # --- Initialize arrays ---
     angles = np.zeros((n_steps, n_joints))
@@ -51,14 +63,13 @@ def run_trial(cfg: SimConfig) -> SimResult:
     F_m = np.zeros((n_steps, 3, 2))
     L_ext = np.zeros((n_steps, 3))
 
-    # --- Initialize body state ---
+    # --- Initialize body state (actual joint angles) ---
     actual_angles = np.array(cfg.start_angles, dtype=np.float64)
-    prev_hand_pos = np.zeros(2)
+    actual_angles_norm = normalize(actual_angles, cfg.norm_polar)
 
-    # Compute initial positions
-    angles_norm = normalize(actual_angles, cfg.norm_polar)
-    all_pos = forward_kinematics_all(angles_norm, np.array(cfg.lengths_norm), cfg.norm_polar)
-    hand_pos = denormalize(all_pos[-1], cfg.norm_cart)
+    # Compute initial hand position
+    init_all_pos = forward_kinematics_all(actual_angles_norm, lengths_norm, cfg.norm_polar)
+    hand_pos = denormalize(init_all_pos[-1], cfg.norm_cart)
     prev_hand_pos = hand_pos.copy()
 
     # --- Initialize brain ---
@@ -77,45 +88,40 @@ def run_trial(cfg: SimConfig) -> SimResult:
             current_cue = _generate_cue(cfg, cue_idx)
             cues_log[cue_idx] = current_cue
             cue_idx += 1
-        elif cue_step >= cfg.n_cues:
-            # Wait period: no new cues, maintain last belief
-            pass
 
-        # --- Generate observations ---
-        angles_norm = normalize(actual_angles, cfg.norm_polar)
-        all_pos = forward_kinematics_all(
-            angles_norm, np.array(cfg.lengths_norm), cfg.norm_polar,
-        )
+        # --- Generate observations from actual body ---
+        all_pos = forward_kinematics_all(actual_angles_norm, lengths_norm, cfg.norm_polar)
         hand_pos_norm = all_pos[-1]
         hand_pos = denormalize(hand_pos_norm, cfg.norm_cart)
-
-        # Compute velocity
         hand_vel = (hand_pos - prev_hand_pos) / max(cfg.dt, 1e-8)
         hand_vel_norm = normalize(hand_vel, cfg.norm_cart)
 
-        # Proprioceptive observation (normalized angles)
-        obs_prop = angles_norm.copy()
-
-        # Visual observation [position, velocity] (normalized)
+        obs_prop = actual_angles_norm.copy()
         obs_vis = np.array([hand_pos_norm, hand_vel_norm])
 
         # --- Brain inference ---
-        action_deg = brain.inference_step(obs_prop, obs_vis, current_cue, step)
+        brain.inference_step(obs_prop, obs_vis, current_cue, step)
 
-        # --- Update body state ---
-        actual_angles += action_deg
-        # Clamp to valid range
-        actual_angles = np.clip(actual_angles, -180.0, 180.0)
+        # --- Body tracks brain's belief (spring-like dynamics) ---
+        believed_angles_norm = brain.int_unit.x[0].copy()
+        actual_angles_norm += (believed_angles_norm - actual_angles_norm) * BODY_TRACKING_GAIN * cfg.dt
+        actual_angles = denormalize(actual_angles_norm, cfg.norm_polar)
 
         prev_hand_pos = hand_pos.copy()
 
         # --- Log data ---
+        # "angles" = actual body angles; "est_angles" = brain's belief
         angles[step] = actual_angles
         est_angles[step] = denormalize(brain.int_unit.x[0], cfg.norm_polar)
-        # Denormalize all positions to pixel space
+
+        # Compute believed arm positions for visualization
+        believed_all_pos = forward_kinematics_all(
+            brain.int_unit.x[0], lengths_norm, cfg.norm_polar,
+        )
         pos[step, 0] = np.array([0.0, 0.0])  # Base
         for j in range(n_joints):
-            pos[step, j + 1] = denormalize(all_pos[j + 1], cfg.norm_cart)
+            pos[step, j + 1] = denormalize(believed_all_pos[j + 1], cfg.norm_cart)
+
         est_pos[step] = denormalize(brain.ext_unit.x[0], cfg.norm_cart)
         states[step] = brain.discrete.prior
         causes[step] = brain.discrete.o_ext

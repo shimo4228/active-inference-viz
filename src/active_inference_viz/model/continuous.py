@@ -146,10 +146,11 @@ class Unit:
         # Prior prediction error
         self.eps_eta_x[0] = (self.x[0] - pred_eta_x) * self.pi_eta_x
 
-        # Backpropagate gradient to parent via Jacobian
+        # Backpropagate gradient to parent via analytical Jacobian.
+        # In PyTorch: eps.backward(eps) computes VJP = -π * J^T @ ε
+        # where π = precision, J = Jacobian of prediction function.
         J = analytical_jacobian(parent_x0, np.array(cfg.lengths_norm), cfg.norm_polar)
-        # grad = J^T @ eps_eta_x[0] (vector-Jacobian product)
-        parent.grad_o[0] += J.T @ self.eps_eta_x[0]
+        parent.grad_o[0] += -self.pi_eta_x * (J.T @ self.eps_eta_x[0])
 
     def step_dynamics(self) -> None:
         """Compute dynamics prediction errors and accumulate evidence."""
@@ -233,19 +234,22 @@ class Obs:
             self.actions = np.zeros(dim)
 
     def step(self, parent: Unit) -> None:
-        """Compute prediction error and propagate gradient to parent."""
+        """Compute prediction error and propagate gradient to parent.
+
+        The VJP from PyTorch's backward(eps) includes a -precision factor:
+        grad = -π_o * J^T @ ε_o. For identity prediction functions (g_prop, g_vis),
+        J = I, so grad = -π_o * ε_o.
+        """
         if self.obs_type == "prop":
             # g_prop: extract position order from internal unit
             pred = parent.x[0].copy()
             self.eps_o = (self.o - pred) * self.pi_o
-            # Gradient: identity mapping, affects only order 0
-            parent.grad_o[0] += self.eps_o
+            parent.grad_o[0] += -self.pi_o * self.eps_o
         elif self.obs_type == "vis":
             # g_vis: identity mapping from external unit
             pred = parent.x.copy()
             self.eps_o = (self.o - pred) * self.pi_o
-            # Gradient: identity, all orders
-            parent.grad_o += self.eps_o
+            parent.grad_o += -self.pi_o * self.eps_o
 
     def update(self, dt: float) -> None:
         """Update actions (proprioceptive only)."""
